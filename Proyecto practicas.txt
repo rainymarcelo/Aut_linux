@@ -1,0 +1,126 @@
+#!/bin/bash
+
+# ==== CONFIGURACIÓN ====
+IPS_FILE="ips.txt"
+USUARIOS_FILE="usuarios.txt"
+COMANDOS_FILE="comandos.txt"
+CARPETA_TMP="/tmp/reporte_remoto"
+CARPETA_LOCAL="./resultados"
+LOG_DIR="./logs"
+ERROR_LOG="./errores.log"
+FECHA=$(date +%Y%m%d_%H%M%S)
+MAX_PROCESOS=5
+
+mkdir -p "$CARPETA_LOCAL" "$LOG_DIR"
+
+# ==== FUNCIONES ====
+
+probar_ssh() {
+    IP=$1
+    while IFS=: read USER PASS; do
+        expect -c "
+            set timeout 5
+            spawn ssh -o StrictHostKeyChecking=no $USER@$IP echo ok
+            expect {
+                \"*yes/no*\" { send \"yes\r\"; exp_continue }
+                \"*assword:*\" { send \"$PASS\r\" }
+            }
+            expect {
+                \"ok\" { exit 0 }
+                timeout { exit 1 }
+                eof { exit 1 }
+            }
+        " >/dev/null 2>&1
+
+        if [ $? -eq 0 ]; then
+            echo "$USER:$PASS"
+            return
+        fi
+    done < "$USUARIOS_FILE"
+    echo ""
+}
+
+procesar_ip() {
+    IP="$1"
+    LOG_FILE="$LOG_DIR/$IP.log"
+    echo "Procesando $IP" > "$LOG_FILE"
+
+    CRED=$(probar_ssh "$IP")
+    if [ -z "$CRED" ]; then
+        echo "Fallo autenticación con $IP" >> "$LOG_FILE"
+        echo "$IP - Fallo autenticación" >> "$ERROR_LOG"
+        return
+    fi
+
+    USER=$(echo "$CRED" | cut -d: -f1)
+    PASS=$(echo "$CRED" | cut -d: -f2)
+
+    # Ejecutar comandos remotos
+    expect <<EOD >> "$LOG_FILE" 2>&1
+set timeout 20
+spawn ssh -tt -o StrictHostKeyChecking=no $USER@$IP
+expect "*assword:*"
+send "$PASS\r"
+expect "#"
+send "mkdir -p $CARPETA_TMP\r"
+$(while IFS=: read CMD_NAME CMD_EXEC; do
+    echo "send \"${CMD_EXEC} > $CARPETA_TMP/${CMD_NAME}_${IP}_$FECHA.txt\r\""
+done < "$COMANDOS_FILE")
+send "whoami > $CARPETA_TMP/whoami_${IP}.txt\r"
+send "exit\r"
+expect eof
+EOD
+
+    # Descargar archivos por SFTP
+    expect <<EOD >> "$LOG_FILE" 2>&1
+set timeout 15
+spawn sftp -o StrictHostKeyChecking=no $USER@$IP
+expect "*assword:*"
+send "$PASS\r"
+expect "sftp>"
+send "get $CARPETA_TMP/whoami_${IP}.txt $CARPETA_LOCAL/\r"
+$(while IFS=: read CMD_NAME CMD_EXEC; do
+    echo "send \"get $CARPETA_TMP/${CMD_NAME}_${IP}_$FECHA.txt $CARPETA_LOCAL/\r\""
+done < "$COMANDOS_FILE")
+send "exit\r"
+expect eof
+EOD
+
+    # Confirmación de root
+    if grep -q "^root$" "$CARPETA_LOCAL/whoami_${IP}.txt" 2>/dev/null; then
+        echo "Autenticado como root en $IP." >> "$LOG_FILE"
+    else
+        echo "Autenticado como $USER en $IP — NO es root." >> "$LOG_FILE"
+    fi
+
+    # Limpieza remota
+    expect <<EOD >> "$LOG_FILE" 2>&1
+set timeout 10
+spawn ssh -o StrictHostKeyChecking=no $USER@$IP "rm -rf $CARPETA_TMP"
+expect "*assword:*"
+send "$PASS\r"
+expect eof
+EOD
+
+    echo "Finalizado $IP" >> "$LOG_FILE"
+}
+
+# ==== EXPORTACIÓN PARA PARALELISMO ====
+export -f procesar_ip
+export -f probar_ssh
+export IPS_FILE USUARIOS_FILE COMANDOS_FILE CARPETA_TMP CARPETA_LOCAL LOG_DIR ERROR_LOG FECHA
+
+xargs -n 1 -P "$MAX_PROCESOS" -I {} bash -c 'procesar_ip "$@"' _ {} < "$IPS_FILE"
+
+# ==== COMBINAR ARCHIVOS POR COMANDO ====
+while IFS=: read CMD_NAME CMD_EXEC; do
+    OUTFILE="$CARPETA_LOCAL/${CMD_NAME}_completo_$FECHA.txt"
+    : > "$OUTFILE"
+    for FILE in "$CARPETA_LOCAL/${CMD_NAME}_"*.txt; do
+        IP=$(echo "$FILE" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')
+        echo "===== IP: $IP =====" >> "$OUTFILE"
+        cat "$FILE" >> "$OUTFILE"
+        echo "" >> "$OUTFILE"
+    done
+    echo "Combinado: $OUTFILE"
+done < "$COMANDOS_FILE"

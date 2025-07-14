@@ -1,0 +1,3 @@
+crm_status:crm status
+df_h: df -h
+top: top -b -n 1
